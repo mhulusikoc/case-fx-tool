@@ -11,9 +11,22 @@ from fastapi.testclient import TestClient
 from app.main import app
 from app import fx_service
 from app.fx_service import fetch_rate
+from app.fx_service import _rate_cache_clear
 
 
 client = TestClient(app)
+
+
+@pytest.fixture(autouse=True)
+def _clear_rate_cache():
+    """Wipe the in-memory rate cache before (and after) every test.
+
+    This prevents cache hits from leaking between tests that use the
+    real fetch_rate with a fake transport.
+    """
+    _rate_cache_clear()
+    yield
+    _rate_cache_clear()
 
 
 # ---------------------------------------------------------------------------
@@ -201,9 +214,11 @@ class _FakeFrankfurterTransport(httpx.AsyncBaseTransport):
         self.body = body
         self.status_code = status_code
         self.last_request: httpx.Request | None = None
+        self.request_count: int = 0
 
     async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
         self.last_request = request
+        self.request_count += 1
         return httpx.Response(
             status_code=self.status_code,
             headers={"content-type": "application/json"},
@@ -622,3 +637,122 @@ async def test_svc_http_429_raises_upstream_error_not_unsupported_currency() -> 
     transport = _FakeFrankfurterTransport({}, status_code=429)
     with pytest.raises(UpstreamError):
         await fetch_rate("EUR", "TRY", _ASKED, _client=_svc_client(transport))
+
+
+# ---------------------------------------------------------------------------
+# Cache behaviour tests — real fetch_rate, fake transport, request_count
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.anyio
+async def test_cache_same_params_hits_upstream_only_once() -> None:
+    """Two identical calls (from/to/date) must produce exactly one HTTP request."""
+    transport = _FakeFrankfurterTransport(_FAKE_UPSTREAM_BODY)
+    c = _svc_client(transport)
+
+    rate1, date1 = await fetch_rate("EUR", "TRY", _ASKED, _client=c)
+    rate2, date2 = await fetch_rate("EUR", "TRY", _ASKED, _client=c)
+
+    assert transport.request_count == 1
+    assert rate1 == rate2
+    assert date1 == date2
+
+
+@pytest.mark.anyio
+async def test_cache_different_date_hits_upstream_twice() -> None:
+    """Different asked_date means a different cache key → two upstream calls."""
+    # Each call uses a body whose upstream date matches the asked_date.
+    call_count = 0
+
+    class _CountingTransport(httpx.AsyncBaseTransport):
+        async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+            nonlocal call_count
+            call_count += 1
+            # Return a body whose date echoes whatever date is in the URL path.
+            path_date = str(request.url).split("/v1/")[1].split("?")[0]
+            body = {"base": "EUR", "date": path_date, "rates": {"TRY": 47.12}}
+            return httpx.Response(
+                200,
+                headers={"content-type": "application/json"},
+                content=json.dumps(body).encode(),
+                request=request,
+            )
+
+    c = httpx.AsyncClient(base_url=fx_service.FX_UPSTREAM_BASE, transport=_CountingTransport())
+    await fetch_rate("EUR", "TRY", date(2026, 8, 27), _client=c)
+    await fetch_rate("EUR", "TRY", date(2026, 8, 28), _client=c)
+
+    assert call_count == 2
+
+
+@pytest.mark.anyio
+async def test_cache_different_target_currency_hits_upstream_twice() -> None:
+    """Different to_currency means a different cache key → two upstream calls."""
+    body_usd = {"base": "EUR", "date": "2026-08-28", "rates": {"USD": 1.08}}
+    transport_usd = _FakeFrankfurterTransport(body_usd)
+    transport_try = _FakeFrankfurterTransport(_FAKE_UPSTREAM_BODY)
+
+    await fetch_rate("EUR", "USD", _ASKED, _client=_svc_client(transport_usd))
+    await fetch_rate("EUR", "TRY", _ASKED, _client=_svc_client(transport_try))
+
+    assert transport_usd.request_count == 1
+    assert transport_try.request_count == 1
+
+
+@pytest.mark.anyio
+async def test_cache_preserves_upstream_rate_date_for_weekend() -> None:
+    """Cache must store the real rate_date (e.g. Friday) for a weekend asked_date.
+
+    Second call with the same Sunday asked_date must return the Friday rate_date
+    from cache without hitting upstream again.
+    """
+    sunday = date(2026, 8, 30)
+    friday_body = {"base": "EUR", "date": "2026-08-28", "rates": {"TRY": 47.1234}}
+    transport = _FakeFrankfurterTransport(friday_body)
+    c = _svc_client(transport)
+
+    rate1, rd1 = await fetch_rate("EUR", "TRY", sunday, _client=c)
+    rate2, rd2 = await fetch_rate("EUR", "TRY", sunday, _client=c)
+
+    assert transport.request_count == 1     # second call came from cache
+    assert rd1 == rd2 == "2026-08-28"       # Friday rate_date preserved
+    assert rate1 == rate2 == Decimal("47.1234")
+
+
+@pytest.mark.anyio
+async def test_cache_error_is_not_cached() -> None:
+    """A failed upstream call must not populate the cache.
+
+    After an UpstreamError, the next call for the same params must retry upstream.
+    """
+    error_transport = _ErrorTransport(lambda: httpx.ConnectError("refused"))
+    success_transport = _FakeFrankfurterTransport(_FAKE_UPSTREAM_BODY)
+
+    # First call fails — must not be cached.
+    with pytest.raises(UpstreamError):
+        await fetch_rate("EUR", "TRY", _ASKED, _client=_svc_client(error_transport))
+
+    # Second call with fresh transport should succeed and hit upstream.
+    rate, rate_date = await fetch_rate("EUR", "TRY", _ASKED, _client=_svc_client(success_transport))
+
+    assert success_transport.request_count == 1
+    assert rate == Decimal("47.1234")
+
+
+@pytest.mark.anyio
+async def test_cache_amount_is_not_part_of_cache_key() -> None:
+    """amount is not a parameter of fetch_rate, so it never influences the cache key.
+
+    Calling fetch_rate twice for the same from/to/date (regardless of what
+    amount the caller will later multiply against the rate) must result in
+    exactly one upstream request.
+    """
+    transport = _FakeFrankfurterTransport(_FAKE_UPSTREAM_BODY)
+    c = _svc_client(transport)
+
+    # Simulate what main.py does for amount=100 and amount=250 on the same pair/date.
+    rate_for_100, _ = await fetch_rate("EUR", "TRY", _ASKED, _client=c)
+    rate_for_250, _ = await fetch_rate("EUR", "TRY", _ASKED, _client=c)
+
+    assert transport.request_count == 1          # only one upstream call
+    assert rate_for_100 == rate_for_250          # same rate returned both times

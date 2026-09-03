@@ -38,6 +38,23 @@ class InvalidUpstreamResponse(Exception):
 
 
 # ---------------------------------------------------------------------------
+# In-memory rate cache
+# ---------------------------------------------------------------------------
+# Key:   (from_currency, to_currency, str(asked_date))
+# Value: (rate: Decimal, rate_date: str)
+#
+# Only successful upstream results are cached.  Errors are never stored,
+# so a transient failure does not permanently block a valid currency pair.
+
+_rate_cache: dict[tuple[str, str, str], tuple[Decimal, str]] = {}
+
+
+def _rate_cache_clear() -> None:
+    """Flush the in-memory rate cache.  For use in tests only."""
+    _rate_cache.clear()
+
+
+# ---------------------------------------------------------------------------
 # Service function
 # ---------------------------------------------------------------------------
 
@@ -53,7 +70,9 @@ async def fetch_rate(
 
     Returns (rate, rate_date) where rate_date is the actual trading date
     returned by upstream, which may be earlier than asked_date
-    (e.g. weekends / public holidays).
+    (e.g. weekends / public holidays).  Successful results are stored in
+    an in-memory cache keyed by (from_currency, to_currency, asked_date)
+    so that repeat requests for the same pair and date skip the upstream call.
 
     Raises:
         UpstreamTimeout: provider did not reply in time.
@@ -63,6 +82,10 @@ async def fetch_rate(
 
     _client is a private injection point for unit testing only.
     """
+    cache_key = (from_currency, to_currency, str(asked_date))
+    if cache_key in _rate_cache:
+        return _rate_cache[cache_key]
+
     url = f"{FX_UPSTREAM_BASE}/v1/{asked_date}"
     params = {"base": from_currency, "symbols": to_currency}
 
@@ -130,5 +153,8 @@ async def fetch_rate(
 
     if not rate.is_finite() or rate <= 0:
         raise InvalidUpstreamResponse()
+
+    # Cache the validated result before returning.
+    _rate_cache[cache_key] = (rate, raw_date)
 
     return rate, raw_date
