@@ -212,6 +212,56 @@ class _FakeFrankfurterTransport(httpx.AsyncBaseTransport):
         )
 
 
+class _RawTransport(httpx.AsyncBaseTransport):
+    """Returns arbitrary raw bytes with a configurable status and content-type.
+
+    Useful for simulating non-JSON upstream responses.
+    """
+
+    def __init__(
+        self,
+        content: bytes,
+        status_code: int = 200,
+        content_type: str = "text/html",
+    ) -> None:
+        self.content = content
+        self.status_code = status_code
+        self.content_type = content_type
+
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            status_code=self.status_code,
+            headers={"content-type": self.content_type},
+            content=self.content,
+            request=request,
+        )
+
+
+class _ErrorTransport(httpx.AsyncBaseTransport):
+    """Raises a given httpx network-level exception on every request.
+
+    exc_factory is a zero-arg callable that returns the exception to raise,
+    so each request gets a fresh exception object.
+    """
+
+    def __init__(self, exc_factory) -> None:
+        self._exc_factory = exc_factory
+
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        raise self._exc_factory()
+
+
+def _svc_client(transport: httpx.AsyncBaseTransport) -> httpx.AsyncClient:
+    """Return an AsyncClient wired to *transport* and the current upstream base."""
+    return httpx.AsyncClient(
+        base_url=fx_service.FX_UPSTREAM_BASE,
+        transport=transport,
+    )
+
+
+_ASKED = date(2026, 8, 28)
+
+
 @pytest.mark.anyio
 async def test_fetch_rate_request_path_and_params() -> None:
     """fetch_rate must call /v1/<date> with base=FROM and symbols=TO."""
@@ -440,3 +490,135 @@ def test_rate_date_in_future_relative_to_asked_date_returns_502() -> None:
 
     assert response.status_code == 502
     assert response.json()["error"] == "invalid_upstream_response"
+
+
+# ---------------------------------------------------------------------------
+# fetch_rate service-level tests — real fetch_rate, fake httpx transport
+# No mock.patch. No real network.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.anyio
+async def test_svc_http_500_raises_upstream_error() -> None:
+    """HTTP 500 from upstream must raise UpstreamError."""
+    transport = _FakeFrankfurterTransport({}, status_code=500)
+    with pytest.raises(UpstreamError):
+        await fetch_rate("EUR", "TRY", _ASKED, _client=_svc_client(transport))
+
+
+@pytest.mark.anyio
+async def test_svc_connection_error_raises_upstream_error() -> None:
+    """Network-level connection failure must raise UpstreamError."""
+    transport = _ErrorTransport(lambda: httpx.ConnectError("refused"))
+    with pytest.raises(UpstreamError):
+        await fetch_rate("EUR", "TRY", _ASKED, _client=_svc_client(transport))
+
+
+@pytest.mark.anyio
+async def test_svc_timeout_raises_upstream_timeout() -> None:
+    """Read timeout must raise UpstreamTimeout, not UpstreamError."""
+    transport = _ErrorTransport(lambda: httpx.ReadTimeout("timed out"))
+    with pytest.raises(UpstreamTimeout):
+        await fetch_rate("EUR", "TRY", _ASKED, _client=_svc_client(transport))
+
+
+@pytest.mark.anyio
+async def test_svc_non_json_response_raises_invalid_upstream_response() -> None:
+    """A non-JSON body (e.g. HTML error page) must raise InvalidUpstreamResponse."""
+    transport = _RawTransport(b"<html>Service Unavailable</html>", status_code=200)
+    with pytest.raises(InvalidUpstreamResponse):
+        await fetch_rate("EUR", "TRY", _ASKED, _client=_svc_client(transport))
+
+
+@pytest.mark.anyio
+async def test_svc_missing_date_field_raises_invalid_upstream_response() -> None:
+    """JSON without 'date' field must raise InvalidUpstreamResponse."""
+    body = {"base": "EUR", "rates": {"TRY": 47.1234}}  # no "date"
+    transport = _FakeFrankfurterTransport(body)
+    with pytest.raises(InvalidUpstreamResponse):
+        await fetch_rate("EUR", "TRY", _ASKED, _client=_svc_client(transport))
+
+
+@pytest.mark.anyio
+async def test_svc_missing_rates_field_raises_invalid_upstream_response() -> None:
+    """JSON without 'rates' field must raise InvalidUpstreamResponse."""
+    body = {"base": "EUR", "date": "2026-08-28"}  # no "rates"
+    transport = _FakeFrankfurterTransport(body)
+    with pytest.raises(InvalidUpstreamResponse):
+        await fetch_rate("EUR", "TRY", _ASKED, _client=_svc_client(transport))
+
+
+@pytest.mark.anyio
+async def test_svc_target_currency_absent_from_rates_raises_unsupported_currency() -> None:
+    """Rate for the requested target currency absent from rates dict → UnsupportedCurrency."""
+    body = {"base": "EUR", "date": "2026-08-28", "rates": {"USD": 1.08}}  # TRY missing
+    transport = _FakeFrankfurterTransport(body)
+    with pytest.raises(UnsupportedCurrency):
+        await fetch_rate("EUR", "TRY", _ASKED, _client=_svc_client(transport))
+
+
+@pytest.mark.anyio
+async def test_svc_rate_zero_raises_invalid_upstream_response() -> None:
+    """rate = 0 is economically impossible; must raise InvalidUpstreamResponse."""
+    body = {"base": "EUR", "date": "2026-08-28", "rates": {"TRY": 0}}
+    transport = _FakeFrankfurterTransport(body)
+    with pytest.raises(InvalidUpstreamResponse):
+        await fetch_rate("EUR", "TRY", _ASKED, _client=_svc_client(transport))
+
+
+@pytest.mark.anyio
+async def test_svc_rate_negative_raises_invalid_upstream_response() -> None:
+    """Negative rate is invalid; must raise InvalidUpstreamResponse."""
+    body = {"base": "EUR", "date": "2026-08-28", "rates": {"TRY": -1}}
+    transport = _FakeFrankfurterTransport(body)
+    with pytest.raises(InvalidUpstreamResponse):
+        await fetch_rate("EUR", "TRY", _ASKED, _client=_svc_client(transport))
+
+
+@pytest.mark.anyio
+async def test_svc_rate_nan_raises_invalid_upstream_response() -> None:
+    """'NaN' string rate cannot be converted to a finite Decimal."""
+    body = {"base": "EUR", "date": "2026-08-28", "rates": {"TRY": "NaN"}}
+    transport = _FakeFrankfurterTransport(body)
+    with pytest.raises(InvalidUpstreamResponse):
+        await fetch_rate("EUR", "TRY", _ASKED, _client=_svc_client(transport))
+
+
+@pytest.mark.anyio
+async def test_svc_rate_date_after_asked_date_raises_invalid_upstream_response() -> None:
+    """upstream date later than asked_date is untrustworthy; raise InvalidUpstreamResponse."""
+    # asked_date = 2026-08-28, upstream claims 2026-08-29
+    body = {"base": "EUR", "date": "2026-08-29", "rates": {"TRY": 47.1234}}
+    transport = _FakeFrankfurterTransport(body)
+    with pytest.raises(InvalidUpstreamResponse):
+        await fetch_rate("EUR", "TRY", _ASKED, _client=_svc_client(transport))
+
+
+@pytest.mark.anyio
+async def test_svc_rate_date_before_asked_date_is_valid() -> None:
+    """upstream date earlier than asked_date (weekend/holiday) is perfectly valid."""
+    # asked_date = Sunday 2026-08-30, upstream returns Friday 2026-08-28
+    asked = date(2026, 8, 30)
+    body = {"base": "EUR", "date": "2026-08-28", "rates": {"TRY": 47.1234}}
+    transport = _FakeFrankfurterTransport(body)
+    rate, rate_date = await fetch_rate("EUR", "TRY", asked, _client=_svc_client(transport))
+
+    assert rate == Decimal("47.1234")
+    assert rate_date == "2026-08-28"
+
+
+@pytest.mark.anyio
+async def test_svc_http_4xx_currency_codes_raise_unsupported_currency() -> None:
+    """HTTP 400 and 404 from upstream must raise UnsupportedCurrency."""
+    for status in (400, 404, 422):
+        transport = _FakeFrankfurterTransport({}, status_code=status)
+        with pytest.raises(UnsupportedCurrency):
+            await fetch_rate("EUR", "ZZZ", _ASKED, _client=_svc_client(transport))
+
+
+@pytest.mark.anyio
+async def test_svc_http_429_raises_upstream_error_not_unsupported_currency() -> None:
+    """HTTP 429 (rate-limit) must raise UpstreamError, never UnsupportedCurrency."""
+    transport = _FakeFrankfurterTransport({}, status_code=429)
+    with pytest.raises(UpstreamError):
+        await fetch_rate("EUR", "TRY", _ASKED, _client=_svc_client(transport))

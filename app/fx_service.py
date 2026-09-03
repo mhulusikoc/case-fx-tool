@@ -79,8 +79,14 @@ async def fetch_rate(
         raise UpstreamError() from exc
 
     # ---- HTTP status --------------------------------------------------------
-    if 400 <= response.status_code < 500:
+    # 400/404/422: Frankfurter uses these for unknown/invalid currency symbols.
+    if response.status_code in (400, 404, 422):
         raise UnsupportedCurrency()
+
+    # 429, 401, 403 and other 4xx are provider-side problems (rate-limit,
+    # auth, etc.) — not a currency issue.  Report as upstream unavailable.
+    if 400 <= response.status_code < 500:
+        raise UpstreamError()
 
     if response.status_code >= 500:
         raise UpstreamError()
