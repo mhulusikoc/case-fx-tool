@@ -5,6 +5,8 @@ from fastapi import FastAPI, Query, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
+from app.fx_service import fetch_rate
+
 app = FastAPI(
     title="FX Conversion Tool",
     version="0.1.0",
@@ -98,8 +100,17 @@ async def convert(
             message="Exchange rates are not available for future dates.",
         )
 
-    return error_response(
-        status_code=501,
-        error="not_implemented",
-        message="Currency conversion is not implemented yet.",
-    )
+    rate, rate_date = await fetch_rate(normalized_from, normalized_to, asked_date)
+
+    result = (amount * rate).quantize(Decimal("0.01"))
+
+    return {
+        "amount": amount,
+        "from": normalized_from,
+        "to": normalized_to,
+        "rate": rate,
+        "result": result,
+        "rate_date": rate_date,
+        "asked_date": str(asked_date),
+        "source": "ECB via frankfurter.dev",
+    }
