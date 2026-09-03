@@ -40,7 +40,8 @@ Multiple AI assistants were used at different stages:
 
 - **OpenAI Codex** — initial implementation scaffolding.
 - **Claude (Sonnet)** — iterative implementation, test design, and edge-case coverage.
-- **ChatGPT** — requirement and edge-case review.
+- **Gemini (3.1 Pro)** — production-oriented review of `tool.py`, reproducing candidate defects and helping rank the Part B findings by customer impact.
+- **ChatGPT** — requirement interpretation, adversarial edge-case review, and final cross-check of both Part A and Part B against the case brief.
 
 In all cases, AI output was manually inspected, run against the test suite, and verified against the case brief before committing. The commit history reflects a step-by-step process rather than a single generated dump.
 
