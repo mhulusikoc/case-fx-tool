@@ -5,7 +5,14 @@ from fastapi import FastAPI, Query, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
-from app.fx_service import fetch_rate
+from app.fx_service import (
+    ECB_START_DATE,
+    InvalidUpstreamResponse,
+    UnsupportedCurrency,
+    UpstreamError,
+    UpstreamTimeout,
+    fetch_rate,
+)
 
 app = FastAPI(
     title="FX Conversion Tool",
@@ -100,7 +107,39 @@ async def convert(
             message="Exchange rates are not available for future dates.",
         )
 
-    rate, rate_date = await fetch_rate(normalized_from, normalized_to, asked_date)
+    if asked_date < ECB_START_DATE:
+        return error_response(
+            status_code=400,
+            error="date_out_of_range",
+            message="Exchange rate data is unavailable for this date.",
+        )
+
+    try:
+        rate, rate_date = await fetch_rate(normalized_from, normalized_to, asked_date)
+    except UpstreamTimeout:
+        return error_response(
+            status_code=504,
+            error="upstream_timeout",
+            message="The exchange-rate provider did not respond in time.",
+        )
+    except UpstreamError:
+        return error_response(
+            status_code=502,
+            error="upstream_error",
+            message="The exchange-rate provider is currently unavailable.",
+        )
+    except UnsupportedCurrency:
+        return error_response(
+            status_code=400,
+            error="unsupported_currency",
+            message="The requested currency is not supported.",
+        )
+    except InvalidUpstreamResponse:
+        return error_response(
+            status_code=502,
+            error="invalid_upstream_response",
+            message="The exchange-rate provider returned an invalid response.",
+        )
 
     result = (amount * rate).quantize(Decimal("0.01"))
 

@@ -269,3 +269,174 @@ async def test_fetch_rate_uses_fx_upstream_base_env(monkeypatch: pytest.MonkeyPa
     assert custom_base in str(transport.last_request.url)
     assert rate == Decimal("47.1234")
     assert rate_date == "2026-08-28"
+
+
+# ---------------------------------------------------------------------------
+# Error-handling tests — endpoint level, no real network
+# ---------------------------------------------------------------------------
+# Helpers that make fetch_rate raise a specific exception.
+
+from app.fx_service import (  # noqa: E402
+    InvalidUpstreamResponse,
+    UnsupportedCurrency,
+    UpstreamError,
+    UpstreamTimeout,
+)
+
+
+def _raise_fetch_rate(exc: Exception):
+    """Patch fetch_rate so it raises *exc* unconditionally."""
+    return patch(
+        "app.main.fetch_rate",
+        new=AsyncMock(side_effect=exc),
+    )
+
+
+# 1. Date before ECB series start -> 400 date_out_of_range (no upstream call)
+
+def test_date_before_ecb_start_returns_date_out_of_range() -> None:
+    """asked_date earlier than 1999-01-04 must be rejected before any upstream call."""
+    response = client.get(
+        "/tools/convert?amount=100&from=EUR&to=USD&date=1998-12-31"
+    )
+
+    assert response.status_code == 400
+    assert response.json() == {
+        "error": "date_out_of_range",
+        "message": "Exchange rate data is unavailable for this date.",
+    }
+
+
+def test_ecb_start_date_itself_is_allowed() -> None:
+    """1999-01-04 (ECB_START_DATE) must pass the range check and reach upstream."""
+    with _mock_fetch_rate(Decimal("1.1865"), "1999-01-04"):
+        response = client.get(
+            "/tools/convert?amount=100&from=EUR&to=USD&date=1999-01-04"
+        )
+
+    assert response.status_code == 200
+
+
+# 2. Timeout -> 504 upstream_timeout
+
+def test_upstream_timeout_returns_504() -> None:
+    with _raise_fetch_rate(UpstreamTimeout()):
+        response = client.get(
+            "/tools/convert?amount=250&from=EUR&to=TRY&date=2026-08-28"
+        )
+
+    assert response.status_code == 504
+    assert response.json() == {
+        "error": "upstream_timeout",
+        "message": "The exchange-rate provider did not respond in time.",
+    }
+
+
+# 3. Connection / network error -> 502 upstream_error
+
+def test_upstream_connection_error_returns_502() -> None:
+    with _raise_fetch_rate(UpstreamError()):
+        response = client.get(
+            "/tools/convert?amount=250&from=EUR&to=TRY&date=2026-08-28"
+        )
+
+    assert response.status_code == 502
+    assert response.json() == {
+        "error": "upstream_error",
+        "message": "The exchange-rate provider is currently unavailable.",
+    }
+
+
+# 4. Upstream HTTP 500 -> 502 upstream_error (same exception path as network error)
+
+def test_upstream_5xx_returns_502() -> None:
+    with _raise_fetch_rate(UpstreamError()):
+        response = client.get(
+            "/tools/convert?amount=250&from=EUR&to=TRY&date=2026-08-28"
+        )
+
+    assert response.status_code == 502
+    assert response.json()["error"] == "upstream_error"
+
+
+# 5. Non-JSON response -> 502 invalid_upstream_response
+
+def test_non_json_upstream_returns_502() -> None:
+    with _raise_fetch_rate(InvalidUpstreamResponse()):
+        response = client.get(
+            "/tools/convert?amount=250&from=EUR&to=TRY&date=2026-08-28"
+        )
+
+    assert response.status_code == 502
+    assert response.json() == {
+        "error": "invalid_upstream_response",
+        "message": "The exchange-rate provider returned an invalid response.",
+    }
+
+
+# 6. Missing "rates" or "date" fields -> 502 invalid_upstream_response
+
+def test_missing_rates_field_returns_502() -> None:
+    with _raise_fetch_rate(InvalidUpstreamResponse()):
+        response = client.get(
+            "/tools/convert?amount=250&from=EUR&to=TRY&date=2026-08-28"
+        )
+
+    assert response.status_code == 502
+    assert response.json()["error"] == "invalid_upstream_response"
+
+
+# 7. Zero or negative rate -> 502 invalid_upstream_response
+
+def test_zero_rate_from_upstream_returns_502() -> None:
+    with _raise_fetch_rate(InvalidUpstreamResponse()):
+        response = client.get(
+            "/tools/convert?amount=250&from=EUR&to=TRY&date=2026-08-28"
+        )
+
+    assert response.status_code == 502
+    assert response.json()["error"] == "invalid_upstream_response"
+
+
+# 8. Unsupported (but format-valid) currency -> 400 unsupported_currency
+
+def test_unsupported_currency_returns_400() -> None:
+    with _raise_fetch_rate(UnsupportedCurrency()):
+        response = client.get(
+            "/tools/convert?amount=250&from=EUR&to=ZZZ&date=2026-08-28"
+        )
+
+    assert response.status_code == 400
+    assert response.json() == {
+        "error": "unsupported_currency",
+        "message": "The requested currency is not supported.",
+    }
+
+
+# 9. Weekend / holiday: upstream rate_date earlier than asked_date -> still 200
+
+def test_weekend_asked_date_returns_200_with_earlier_rate_date() -> None:
+    """Frankfurter shifts weekends back to Friday; this must remain a success."""
+    # asked_date = Sunday 2026-08-30, upstream returns Friday 2026-08-28
+    with _mock_fetch_rate(Decimal("47.1234"), "2026-08-28"):
+        response = client.get(
+            "/tools/convert?amount=100&from=EUR&to=TRY&date=2026-08-30"
+        )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["asked_date"] == "2026-08-30"
+    assert body["rate_date"] == "2026-08-28"
+
+
+# 10. rate_date > asked_date -> 502 invalid_upstream_response
+
+def test_rate_date_in_future_relative_to_asked_date_returns_502() -> None:
+    """Upstream must never return a rate_date that is after asked_date."""
+    with _raise_fetch_rate(InvalidUpstreamResponse()):
+        response = client.get(
+            "/tools/convert?amount=100&from=EUR&to=TRY&date=2026-08-28"
+        )
+
+    assert response.status_code == 502
+    assert response.json()["error"] == "invalid_upstream_response"
