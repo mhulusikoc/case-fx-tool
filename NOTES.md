@@ -36,7 +36,13 @@ Cache key: `(from_currency, to_currency, asked_date)`. `amount` is excluded — 
 
 ## AI Tools
 
-Claude (Sonnet) was used throughout this case for code generation, test design, and edge-case review. Every change was manually inspected, run against the test suite, and verified against the case brief before committing. The commit history reflects an iterative, step-by-step process rather than a single dump.
+Multiple AI assistants were used at different stages:
+
+- **OpenAI Codex** — initial implementation scaffolding.
+- **Claude (Sonnet)** — iterative implementation, test design, and edge-case coverage.
+- **ChatGPT** — requirement and edge-case review.
+
+In all cases, AI output was manually inspected, run against the test suite, and verified against the case brief before committing. The commit history reflects a step-by-step process rather than a single generated dump.
 
 ---
 
@@ -44,4 +50,4 @@ Claude (Sonnet) was used throughout this case for code generation, test design, 
 
 In the initial error-handling pass, the AI mapped all upstream HTTP 4xx responses to `unsupported_currency`. That made sense for `404` (unknown symbol), but `429 Too Many Requests` is a rate-limit from the provider — telling the customer their currency is "not supported" because Frankfurter is throttling us would be wrong and confusing.
 
-I caught this during code review, noted that provider-side problems (`429`, `401`, `403`) should surface as `upstream_error` rather than `unsupported_currency`, and updated the status-code branching accordingly. A dedicated test — `test_svc_http_429_raises_upstream_error_not_unsupported_currency` — was added to lock in the correct behaviour.
+During review, this issue was identified: provider-side problems (`429`, `401`, `403`) should surface as `upstream_error` rather than `unsupported_currency`, and the status-code branching was updated accordingly. A dedicated test — `test_svc_http_429_raises_upstream_error_not_unsupported_currency` — was added to lock in the correct behaviour.

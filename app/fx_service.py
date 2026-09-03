@@ -123,6 +123,12 @@ async def fetch_rate(
     if not isinstance(data, dict):
         raise InvalidUpstreamResponse()
 
+    # ---- Validate "base" field ----------------------------------------------
+    # Ensure upstream is responding for the currency we actually requested.
+    base = data.get("base")
+    if not isinstance(base, str) or base != from_currency:
+        raise InvalidUpstreamResponse()
+
     # ---- Validate "date" field ----------------------------------------------
     raw_date = data.get("date")
     if not isinstance(raw_date, str):

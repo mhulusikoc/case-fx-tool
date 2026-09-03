@@ -756,3 +756,38 @@ async def test_cache_amount_is_not_part_of_cache_key() -> None:
 
     assert transport.request_count == 1          # only one upstream call
     assert rate_for_100 == rate_for_250          # same rate returned both times
+
+
+# ---------------------------------------------------------------------------
+# Base field validation tests — real fetch_rate, fake transport
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.anyio
+async def test_svc_missing_base_raises_invalid_upstream_response() -> None:
+    """Upstream payload without a 'base' field must raise InvalidUpstreamResponse."""
+    body = {"date": "2026-08-28", "rates": {"TRY": 47.1234}}  # no "base"
+    transport = _FakeFrankfurterTransport(body)
+    with pytest.raises(InvalidUpstreamResponse):
+        await fetch_rate("EUR", "TRY", _ASKED, _client=_svc_client(transport))
+
+
+@pytest.mark.anyio
+async def test_svc_wrong_base_raises_invalid_upstream_response() -> None:
+    """Upstream payload whose 'base' differs from the requested from_currency
+    must raise InvalidUpstreamResponse — a USD rate must never be used for an
+    EUR-based conversion."""
+    body = {"base": "USD", "date": "2026-08-28", "rates": {"TRY": 38.5}}
+    transport = _FakeFrankfurterTransport(body)
+    with pytest.raises(InvalidUpstreamResponse):
+        await fetch_rate("EUR", "TRY", _ASKED, _client=_svc_client(transport))
+
+
+@pytest.mark.anyio
+async def test_svc_correct_base_succeeds() -> None:
+    """When 'base' matches from_currency, the existing success path is unchanged."""
+    transport = _FakeFrankfurterTransport(_FAKE_UPSTREAM_BODY)  # base="EUR"
+    rate, rate_date = await fetch_rate("EUR", "TRY", _ASKED, _client=_svc_client(transport))
+
+    assert rate == Decimal("47.1234")
+    assert rate_date == "2026-08-28"

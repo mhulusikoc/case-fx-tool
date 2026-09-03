@@ -28,8 +28,15 @@ Override the port (default `8080`):
 PORT=8091 ./run.sh
 ```
 
-The upstream base URL is read from `FX_UPSTREAM_BASE` (default: `https://api.frankfurter.dev`).  
-Nothing in the application hardcodes that host.
+All upstream requests use `FX_UPSTREAM_BASE`; when unset, it defaults to `https://api.frankfurter.dev`.
+
+Once running:
+
+| | |
+|---|---|
+| Service | http://localhost:8080 |
+| API docs | http://localhost:8080/docs |
+| Health check | http://localhost:8080/health |
 
 ---
 
