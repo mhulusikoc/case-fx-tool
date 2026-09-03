@@ -104,7 +104,7 @@ GET /tools/convert?amount=250&from=EUR&to=TRY&date=2026-08-28
 | HTTP | `error` | When |
 |---|---|---|
 | 400 | `invalid_request` | Missing or unparseable query parameter |
-| 400 | `invalid_amount` | Amount ≤ 0, non-finite, or more than 2 decimal places |
+| 400 | `invalid_amount` | Amount ≤ 0 or more than 2 decimal places |
 | 400 | `invalid_currency` | Currency code is not a 3-letter alphabetic string |
 | 400 | `same_currency` | `from` and `to` are identical |
 | 400 | `future_date` | Requested date is after today |

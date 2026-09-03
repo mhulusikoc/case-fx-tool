@@ -1,5 +1,5 @@
 from datetime import date
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 
 from fastapi import FastAPI, Query, Request
 from fastapi.exceptions import RequestValidationError
@@ -141,7 +141,14 @@ async def convert(
             message="The exchange-rate provider returned an invalid response.",
         )
 
-    result = (amount * rate).quantize(Decimal("0.01"))
+    try:
+        result = (amount * rate).quantize(Decimal("0.01"))
+    except InvalidOperation:
+        return error_response(
+            status_code=400,
+            error="invalid_amount",
+            message="Amount is too large to convert safely.",
+        )
 
     return {
         "amount": amount,

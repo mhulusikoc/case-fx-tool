@@ -108,6 +108,19 @@ def test_amount_with_more_than_two_decimal_places_returns_invalid_amount() -> No
     assert response.json() == INVALID_AMOUNT_RESPONSE
 
 
+def test_oversized_amount_returns_invalid_amount() -> None:
+    with _mock_fetch_rate(Decimal("47.1234"), "2026-08-28"):
+        response = client.get(
+            f"/tools/convert?amount={'9' * 40}&from=EUR&to=TRY&date=2026-08-28"
+        )
+
+    assert response.status_code == 400
+    assert response.json() == {
+        "error": "invalid_amount",
+        "message": "Amount is too large to convert safely.",
+    }
+
+
 def test_malformed_currency_returns_invalid_currency() -> None:
     response = client.get(
         "/tools/convert?amount=250&from=EURO&to=TRY&date=2026-08-28"
